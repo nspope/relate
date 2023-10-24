@@ -40,6 +40,8 @@ int main(int argc, char* argv[]){
 		("transversion", "Only use transversion for bl estimation.")
     ("postprocess", "(beta option) Postprocess topology.")
     ("randomise", "(beta option) Randomise topology in post processing step.")
+    ("variational", "(beta option) Use expectation propagation to estimate branch lengths.")
+    ("order", "(beta option) Optional. Order of quadrature grid for expectation propagation. Default is 10.", cxxopts::value<std::size_t>())
     ("i,input", "Filename of input.", cxxopts::value<std::string>())
 		("painting", "Optional. Copying and transition parameters in chromosome painting algorithm. Format: theta,rho. Default: 0.025,1.", cxxopts::value<std::string>())
     ("seed", "Optional. Seed for MCMC in branch lengths estimation.", cxxopts::value<int>());

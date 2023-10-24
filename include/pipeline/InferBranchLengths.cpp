@@ -10,6 +10,7 @@
 #include "anc.hpp"
 #include "branch_length_estimator.hpp"
 #include "anc_builder.hpp"
+#include "expectation_propagation.hpp"
 
 int GetBranchLengths(cxxopts::Options& options, int chunk_index, int first_section, int last_section){
 
@@ -25,6 +26,11 @@ int GetBranchLengths(cxxopts::Options& options, int chunk_index, int first_secti
     std::cout << options.help({""}) << std::endl;
     std::cout << "Use after FindEquivalentBranches to infer branch lengths." << std::endl;
     exit(0);
+  }
+
+  std::size_t order = options.count("order") ? options["order"].as<std::size_t>() : 10;
+  if (options.count("variational")) {
+    std::cout << "Using expectation propagation (quadrature order: " << order << ") to infer branch lengths (experimental)" << std::endl;
   }
 
   int seed;
@@ -185,31 +191,40 @@ int GetBranchLengths(cxxopts::Options& options, int chunk_index, int first_secti
       filename = dirname + options["output"].as<std::string>() + "_" + std::to_string(section) + ".anc";
       anc.ReadBin(filename);
 
-      //Infer branch lengths
-      //InferBranchLengths bl(data);
-      EstimateBranchLengthsWithSampleAge bl(data);
-      //EstimateBranchLengthsWithSampleAge bl2(data, sample_ages);
-
-      int num_sec = (int) anc.seq.size()/100.0 + 1;
-
-      if(is_coal){
-        for(CorrTrees::iterator it_seq = anc.seq.begin(); it_seq != anc.seq.end(); it_seq++){
-          bl.MCMCVariablePopulationSizeForRelate(data, (*it_seq).tree, epoch, coalescent_rate, rand()); //this is estimating times
-          //bl2.MCMCVariablePopulationSizeSample(data, (*it_seq).tree, epoch, coalescent_rate, 2e4, 1, rand());
+      if (options.count("variational")) {
+        /* Infer branch lengths with EP */
+        if (is_coal) {
+          EstimateBranchLengthsVariational bl(&data, epoch, coalescent_rate, order);
+          for(auto itt = anc.seq.begin(); itt != anc.seq.end(); ++itt) bl.EP(itt->tree);
+        } else {
+          EstimateBranchLengthsVariational bl(&data, 1.0 / data.Ne, order);
+          for(auto itt = anc.seq.begin(); itt != anc.seq.end(); ++itt) bl.EP(itt->tree);
         }
-      }else{
-        int count = 0;
-        CorrTrees::iterator it_seq = anc.seq.begin();
-        for(; it_seq != anc.seq.end(); it_seq++){
-          if(count % num_sec == 0){
-            std::cerr << "[" << section << "/" << last_section << "] " << "[" << count << "/" << anc.seq.size() << "]\r";
-            std::cerr.flush(); 
+      } else {
+        /* Infer branch lengths with MCMC */
+        //InferBranchLengths bl(data);
+        EstimateBranchLengthsWithSampleAge bl(data);
+        //EstimateBranchLengthsWithSampleAge bl2(data, sample_ages);
+        int num_sec = (int) anc.seq.size()/100.0 + 1;
+        if(is_coal){
+          for(CorrTrees::iterator it_seq = anc.seq.begin(); it_seq != anc.seq.end(); it_seq++){
+            bl.MCMCVariablePopulationSizeForRelate(data, (*it_seq).tree, epoch, coalescent_rate, rand()); //this is estimating times
+            //bl2.MCMCVariablePopulationSizeSample(data, (*it_seq).tree, epoch, coalescent_rate, 2e4, 1, rand());
           }
-          count++;
-          //bl.MCMC(data, (*it_seq).tree, seed); //this is estimating times
-          bl.MCMC(data, (*it_seq).tree, rand()); //this is estimating times
+        }else{
+          int count = 0;
+          CorrTrees::iterator it_seq = anc.seq.begin();
+          for(; it_seq != anc.seq.end(); it_seq++){
+            if(count % num_sec == 0){
+              std::cerr << "[" << section << "/" << last_section << "] " << "[" << count << "/" << anc.seq.size() << "]\r";
+              std::cerr.flush(); 
+            }
+            count++;
+            //bl.MCMC(data, (*it_seq).tree, seed); //this is estimating times
+            bl.MCMC(data, (*it_seq).tree, rand()); //this is estimating times
+          }
+          std::cerr << "[" << section << "/" << last_section << "] " << "[" << count << "/" << anc.seq.size() << "]\r";
         }
-        std::cerr << "[" << section << "/" << last_section << "] " << "[" << count << "/" << anc.seq.size() << "]\r";
       }
 
       //Dump to file
@@ -218,6 +233,11 @@ int GetBranchLengths(cxxopts::Options& options, int chunk_index, int first_secti
     }
 
   }else{
+
+    if (options.count("variational")) {
+      std::cout << "Variational dating cannot currently use non-contemporary samples" << std::endl;
+      exit(0);
+    }
 
     last_section = std::min(num_windows-1, last_section);
     for(int section = first_section; section <= last_section; section++){
