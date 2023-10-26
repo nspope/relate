@@ -18,6 +18,7 @@
 
 #define OPTIM_MAXITT 100
 #define OPTIM_RELTOL 1e-8
+#define IS_MINGAP 1e-12
 
 // --------------- GAMMA DISTRIBUTION ------------------- //
 
@@ -139,6 +140,12 @@ struct gamma_distr_t
     beta -= other.beta;
   }
 
+  friend std::ostream& operator<<(std::ostream& os, const gamma_distr_t& self)
+  {
+    os << "Gamma(" << self.shape() << ", " << self.rate() << ")";
+    return os;
+  }
+
   explicit operator bool() const
   {
     /* is integrable */
@@ -167,7 +174,27 @@ struct timescale_t
     const std::size_t dim;
     std::vector<double> gens_breaks, coal_breaks, gens_step, coal_step, rate;
 
+    static
+    double average_rate (const std::vector<double>& epoch, const std::vector<double>& coal) {
+				/* expected pairwise coalescence rate under the piecewise constant history 
+           (integrate PDF for pairwise coalescence times under time rescaling) */
+        std::vector<double> duration (epoch.size() - 1);
+        std::vector<double> weight (epoch.size(), 1.0);
+        std::vector<double> integrand (epoch.size(), 1.0);
+        for (std::size_t i = 1; i < epoch.size(); ++i) {
+          duration[i-1] = exp(-(epoch[i] - epoch[i-1]) * coal[i-1]);
+          weight[i] = weight[i-1] * duration[i-1];
+          integrand[i-1] = (1.0 - duration[i-1]) / coal[i-1];
+        }
+        integrand.back() /= coal.back();
+        double expected_rate = 
+          std::inner_product(weight.begin(), weight.end(), integrand.begin(), 0.0);
+        return expected_rate;
+    }
+
   public:
+    double pairwise_tmrca;
+
     timescale_t(const std::vector<double>& epoch_breaks, const std::vector<double>& epoch_rate)
       : dim (epoch_rate.size())
       , rate (epoch_rate)
@@ -185,6 +212,7 @@ struct timescale_t
         coal_breaks[i] = gens_breaks[i] * rate[i] + gens_step[i];
         coal_step[i] = coal_step[i - 1] + coal_breaks[i] * (1./rate[i - 1] - 1./rate[i]);
       }
+      pairwise_tmrca = average_rate(epoch_breaks, epoch_rate);
     }
 
     double to_generations(const double& coalescents) const
@@ -261,6 +289,7 @@ struct conditional_coalescent_prior_t
   /* Topology-conditioned coalescent prior, on the coalescent timescale */
 
   private:
+
     std::vector<double> pr_node_is_event (std::vector<trio_t> trios)
     {
       /* u[i][k] is the proportion of permissible permutations where node i is event k.
@@ -282,27 +311,16 @@ struct conditional_coalescent_prior_t
       /* recursively calculate state probabilities */
       std::reverse(trios.begin(), trios.end());
       std::vector<double> u (N*E, 0.0); // row-major order
-      u[root*N + 0] = 1.0;
+      u[root*E + 0] = 1.0;
       for (auto& i : trios) {
         for (auto& c : {i.lchild, i.rchild}) {
           for (std::size_t t = 0; t < E - 1; ++t) {
             a = (E - t - n[c]) / (E - t - 1.0);
             b = n[c] / (E - t - 1.0);
-            u[N*c+t+1] = a * u[N*c+t] + b * u[N*i.parent+t];
+            u[E*c+t+1] = a * u[E*c+t] + b * u[E*i.parent+t];
           }
         }
       }
-      //std::vector<std::vector<double>> u (N, std::vector<double>(E, 0.0));
-      //u[root][0] = 1.0;
-      //for (auto& i : trios) {
-      //  for (auto& c : {i.lchild, i.rchild}) {
-      //    for (std::size_t t = 0; t < E - 1; ++t) {
-      //      a = (E - t - n[c]) / (E - t - 1.0);
-      //      b = n[c] / (E - t - 1.0);
-      //      u[c][t + 1] = a * u[c][t] + b * u[i.parent][t];
-      //    }
-      //  }
-      //}
 
       return u;
     }
@@ -329,9 +347,9 @@ struct conditional_coalescent_prior_t
       }
 
       /* marginalize over node-event probabilities */
-      std::vector<double> P = pr_node_is_event(trios);
+      auto P = pr_node_is_event(trios);
       for (auto& i : trios) {
-        auto row = P.begin() + N*i.parent;
+        auto row = P.begin() + E*i.parent;
         nodes[i.parent] = gamma_distr_t::from_sufficient(
             std::inner_product(row, row + E, mean.rbegin(), 0.0),
             std::inner_product(row, row + E, logmean.rbegin(), 0.0)
@@ -369,7 +387,7 @@ struct expectation_propagation_t
          t_i > t_j = t_k = 0. The integral (omitting the prior) is,
 
          \int_0^\infty 
-           t_i^{a_i + a_ij + a_ik} e^{t_i (b_i + b_ij + b_ik}
+           t_i^{a_i + a_ij + a_ik} e^{t_i (b_i + b_ij + b_ik)}
          dt_i
        */
 
@@ -379,20 +397,27 @@ struct expectation_propagation_t
         return prior.loglik(timescale.to_coalescents(t_i));
       };
 
+      /* approximate prior assuming constant population size */
+      gamma_distr_t proposal(prior.alpha, prior.beta / timescale.pairwise_tmrca);
+      auto prop_i = [&proposal,&timescale] (const double t_i) {
+        return proposal.loglik(t_i);
+      };
+
       /* quadrature over ages of parent and older child */
       double t_i, lp, alpha, beta, scale;
       const std::size_t dim = order;
       std::vector<double> weight, age_i, log_i;
       weight.reserve(dim); age_i.reserve(dim); log_i.reserve(dim);
 
-      alpha = q_i.alpha + std::floor(l_k.alpha) + std::floor(l_j.alpha);
-      beta = q_i.beta + l_k.beta + l_j.beta;
+      alpha = q_i.alpha + l_k.alpha + l_j.alpha + proposal.alpha;
+      beta = q_i.beta + l_k.beta + l_j.beta + proposal.beta;
+      assert (alpha > -1.0);
+      assert (beta < 0.0);
       scale = log(-beta) * (-alpha - 1.0);
       gauss_laguerre_t quad_i (order, alpha);
       for (auto& i : quad_i.grid) {
         t_i = -i.abscissa / beta;
-        /* collect integrand and samples */
-        lp = prior_i(t_i) + i.logweight + scale;
+        lp = prior_i(t_i) - prop_i(t_i) + i.logweight + scale;
         weight.push_back(lp); age_i.push_back(t_i); log_i.push_back(log(t_i));
       }
 
@@ -449,6 +474,12 @@ struct expectation_propagation_t
         );
       };
 
+      /* approximate prior assuming constant population size */
+      gamma_distr_t proposal(prior.alpha, prior.beta / timescale.pairwise_tmrca);
+      auto prop_ij = [&proposal,&timescale] (const double t_i, const double t_j) {
+        return proposal.loglik(t_i - t_j);
+      };
+
       /* quadrature over ages of parent and older child */
       double t_i, t_j, lp, alpha, beta, scale;
       const std::size_t dim = std::pow(order, 2);
@@ -456,17 +487,18 @@ struct expectation_propagation_t
       weight.reserve(dim); age_i.reserve(dim); log_i.reserve(dim);
       age_j.reserve(dim); log_j.reserve(dim);
 
-      alpha = q_i.alpha + q_j.alpha + std::floor(l_k.alpha) + std::floor(l_j.alpha) + 1;
+      alpha = q_i.alpha + q_j.alpha + l_k.alpha + l_j.alpha + proposal.alpha + 1.0;
       gauss_laguerre_t quad_i (order, alpha);
-      gauss_jacobi_t quad_j (order, q_j.alpha + std::floor(l_j.alpha) + 1, q_j.alpha + 1);
+      gauss_jacobi_t quad_j (order, l_j.alpha + proposal.alpha, q_j.alpha);
       for (auto& j : quad_j.grid) {
-        beta = q_i.beta + l_k.beta + l_j.beta*(1 - j.abscissa) + q_j.beta*j.abscissa;
+        beta = q_i.beta + l_k.beta + (l_j.beta + proposal.beta)*(1 - j.abscissa) + q_j.beta*j.abscissa;
+        assert (beta < 0.0);
         scale = log(-beta) * (-alpha - 1.0);
         for (auto& i : quad_i.grid) {
           t_i = -i.abscissa / beta;
           t_j = j.abscissa * t_i;
           /* collect integrand and samples */
-          lp = prior_ij(t_i, t_j) + i.logweight + j.logweight + scale;
+          lp = prior_ij(t_i, t_j) - prop_ij(t_i, t_j) + i.logweight + j.logweight + scale;
           weight.push_back(lp);
           age_i.push_back(t_i); log_i.push_back(log(t_i));
           age_j.push_back(t_j); log_j.push_back(log(t_j));
@@ -500,95 +532,86 @@ struct expectation_propagation_t
         const timescale_t& timescale, const std::size_t order
     ) {
       /* Estimate moments of surrogate via Gaussian quadrature, conditioned on
-         t_i > t_j > t_k, with all t random. The integral (omitting prior) is,
+         t_i > t_j > t_k. The integral (omitting prior) is,
 
-         \int_0^\infty \int_0^t_i \int 0^t_j
-         t_i^{a_i} t_j^{a_j} t_k^{a_k} (t_i - t_j)^{a_ij} (t_i - t_k)^{a_ik} \times
-           e^{b_i t_i + b_j t_j + b_k t_k + (t_i - t_j) b_ij + (t_i - t_k) b_ik
-           dt_k dt_j dt_i
-
-         = \int_0^\infty \int_0^t_i 
+         \int_0^\infty \int_0^t_i 
          t_i^{a_i} t_j^{a_j} (t_i - t_j)^{a_ij} \times
          e^{b_i t_i + b_j t_j + (t_i - t_j) b_ij + t_i b_ik} \times
-         \int 0^t_j t_k^{a_k} (t_i - t_k)^{a_ik} e^{t_k (b_k - b_ik)} dt_k 
-         dt_j dt_i
+         \int 0^t_j t_k^{a_k} (t_i - t_k)^{a_ik} e^{t_k (b_k - b_ik)} 
+         dt_k dt_j dt_i
 
          (u := t_k/t_j)
 
          = \int_0^\infty \int_0^t_i 
          t_i^{a_i} t_j^{a_j} (t_i - t_j)^{a_ij} \times
          e^{b_i t_i + b_j t_j + (t_i - t_j) b_ij + t_i b_ik} \times
-         t_j^{1 + a_k} t_i^{a_ik} \int 0^1 u^{a_k} (1 - t_j/t_i u)^{a_ik} e^{t_j u (b_k - b_ik)} dt_k 
-         dt_j dt_i
-
-         = \int_0^\infty \int_0^t_i 
-         t_i^{a_i} t_j^{a_j} (t_i - t_j)^{a_ij} \times
-         e^{b_i t_i + b_j t_j + (t_i - t_j) b_ij + t_i b_ik} \times
-         t_j^{1 + a_k} e^{t_j (b_k - b_ik)} \times
-         \sum_{n=0}^{a_ik} G(a_ik+1)/G(a_ik+1-n) G(a_k+1)/G(a_k+2+n) \times
-            t_j^n (t_i - t_j)^{a_ik - n} 1F1(n + 1, a_k + 2 + n, (b_ik - b_k) t_j)
-         dt_j dt_i
+         t_j^{1 + a_k} t_i^{a_ik} \int 0^1 u^{a_k} (1 - t_j/t_i u)^{a_ik} e^{t_j u (b_k - b_ik)} 
+         du dt_j dt_i
 
          (v := t_j/t_i)
 
          = \int_0^\infty \int_0^1
          t_i^{a_i + 1} (t_i v)^{a_j} (t_i - t_i v)^{a_ij} \times
          e^{b_i t_i + b_j t_i v + (t_i - t_i v) b_ij + t_i b_ik} \times
-         (t_i v)^{1 + a_k} e^{t_i v (b_k - b_ik)} \times
-         \sum_{n=0}^{a_ik} G(a_ik+1)/G(a_ik+1-n) G(a_k+1)/G(a_k+2+n) \times
-            (t_i v)^n (t_i - t_i v)^{a_ik - n} 1F1(n + 1, a_k + 2 + n, (b_ik - b_k) t_i v)
-         dt_j dt_i
+         (t_i v)^{1 + a_k} t_i^{a_ik} \int 0^1 u^{a_k} (1 - v u)^{a_ik} e^{t_i v u (b_k - b_ik)} 
+         du dv dt_i
 
-         Altering order of summation/integration,
+         = \int_0^\infty \int_0^1
+         t_i^{a_i + a_j + a_k + a_ij + a_ik + 2} v^{a_j + a_k + 1} (1 - v)^{a_ij} \times
+         e^{b_i t_i + b_j t_i v + (t_i - t_i v) b_ij + t_i b_ik + t_i v u (b_k - b_ik)} \times
+         \int 0^1 u^{a_k} (1 - v u)^{a_ik}
+         du dv dt_i
 
-         \sum_{n=0}^{a_ik} G(a_ik+1)/G(a_ik+1-n) G(a_k+1)/G(a_k+2+n) \times
-           \int_0^1 v^{a_j + a_k + n + 1} (1 - v)^{a_ij + a_ik - n} \times
-              \int_0^\infty 
-                t_i^{a_i + a_j + a_k + a_ij + a_ik + 2} 
-                e^{t_i (b_i + (b_ij + b_ik) (1 - v) + (b_k + b_j) v)}
-                1F1(n + 1, a_k + 2 + n, (b_ik - b_k) t_i v)
-           dt_i dt_j
+         Rearranging,
+
+         = \int 0^1 v^{a_j + a_k + 1} (1 - v)^{a_ij} \int_0^1 u^{a_k} (1 - v u)^{a_ik} 
+         \int_0^\infty t_i^{a_i + a_j + a_k + a_ij + a_ik + 2}
+         e^{t_i (b_i + b_j v + (1 - v) b_ij + b_ik + v u (b_k - b_ik))}
+         dt_i du dv
        */
 
-      /* prior on difference in ages between parent and oldest child,
+      /* exact prior on difference in ages between parent and oldest child,
          on the coalescent timescale */
       auto prior_ij = [&prior,&timescale] (const double t_i, const double t_j) {
-        return prior.loglik(
-            timescale.to_coalescents(t_i) - timescale.to_coalescents(t_j)
-        );
+        return prior.loglik(timescale.to_coalescents(t_i) - timescale.to_coalescents(t_j));
+      };
+
+      /* approximate prior assuming constant population size */
+      gamma_distr_t proposal(prior.alpha, prior.beta / timescale.pairwise_tmrca);
+      auto prop_ij = [&proposal,&timescale] (const double t_i, const double t_j) {
+        return proposal.loglik(t_i - t_j);
       };
 
       /* quadrature over ages of parent and older child */
-      double t_i, t_j, t_k, ln_t_k, lp, alpha, beta, scale, C, M, da, db, dx, d2x;
-      const std::size_t dim = std::pow(order, 2) * std::size_t(l_k.alpha);
+      double t_i, t_j, t_k, ln_t_k, lp, alpha, beta, scale;
+      const std::size_t dim = std::pow(order, 3);
       std::vector<double> weight, age_i, log_i, age_j, log_j, age_k, log_k; 
       weight.reserve(dim); age_i.reserve(dim); log_i.reserve(dim);
       age_j.reserve(dim); log_j.reserve(dim); age_k.reserve(dim); log_k.reserve(dim);
 
-      alpha = q_i.alpha + q_k.alpha + q_j.alpha + 
-        std::floor(l_k.alpha) + std::floor(l_j.alpha) + 2;
+      alpha = q_i.alpha + q_k.alpha + q_j.alpha + l_k.alpha + l_j.alpha + proposal.alpha + 2;
       gauss_laguerre_t quad_i (order, alpha);
-      for (std::size_t n = 0; n <= std::size_t(l_k.alpha); ++n) {
-        gauss_jacobi_t quad_j (order, alpha - q_i.alpha, q_j.alpha + q_k.alpha + n + 2);
-        C = std::lgamma(std::floor(l_k.alpha) + 1) + std::lgamma(q_k.alpha + 1) - 
-          std::lgamma(q_k.alpha + 2 + n) - std::lgamma(std::floor(l_k.alpha) - n + 1);
-        for (auto& j : quad_j.grid) {
-          beta = q_i.beta + (l_k.beta + l_j.beta)*(1 - j.abscissa) + (q_j.beta + q_k.beta)*j.abscissa;
-          scale = log(-beta) * (-alpha - 1.0) + C; 
+      gauss_jacobi_t quad_j (order, l_j.alpha + proposal.alpha, q_j.alpha + q_k.alpha + 1);
+      gauss_jacobi_t quad_k (order, 0.0, q_k.alpha);
+      for (auto& j : quad_j.grid) {
+        for (auto& k : quad_k.grid) {
+          beta = q_i.beta + q_j.beta*j.abscissa + 
+            (l_j.beta + proposal.beta)*(1 - j.abscissa) + 
+            q_k.beta*j.abscissa*k.abscissa + l_k.beta*(1 - j.abscissa*k.abscissa);
+          assert (beta < 0.0);
+          scale = log(-beta) * (-alpha - 1.0); 
           for (auto& i : quad_i.grid) {
             t_i = -i.abscissa / beta;
             t_j = j.abscissa * t_i;
-            /* marginalize over age of youngest child, calculating expectations
-               by differentating natural parameters */
-            M = hyp1f1_t::taylor_series(n + 1, q_k.alpha + n + 2, (l_k.beta - q_k.beta)*t_j, da, db, dx, d2x);
-            t_k = t_j * (1.0 - dx);
-            ln_t_k = log(t_j) + db + digamma(q_k.alpha + 1) - digamma(q_k.alpha + 2 + n);
+            t_k = k.abscissa * t_j;
             /* collect integrand and samples */
-            lp = prior_ij(t_i, t_j) + M + i.logweight + j.logweight + scale;
+            lp = prior_ij(t_i, t_j) - prop_ij(t_i, t_j) + 
+              log(1.0 - j.abscissa * k.abscissa)*l_k.alpha + 
+              i.logweight + j.logweight + k.logweight + scale;
             weight.push_back(lp);
             age_i.push_back(t_i); log_i.push_back(log(t_i));
             age_j.push_back(t_j); log_j.push_back(log(t_j));
-            age_k.push_back(t_k); log_k.push_back(ln_t_k);
+            age_k.push_back(t_k); log_k.push_back(log(t_k));
           }
         }
       }
@@ -624,6 +647,8 @@ struct expectation_propagation_t
     ) {
       /* Estimate moments of surrogate via quadrature. The mutation counts (l_j.alpha, l_k.alpha)
          are silently converted to integers. */
+
+      //std::cout << q_i << " " << q_j << " " << q_k << " " << prior << " " << l_j << " " << l_k << std::endl;//DEBUG
 
       double logconst;
 
@@ -695,6 +720,9 @@ struct expectation_propagation_t
     ) {
       /* Estimate moments of surrogate via importance sampling */
 
+      /* approximate prior with constant effective population size */
+      gamma_distr_t proposal (prior.alpha, prior.beta / timescale.pairwise_tmrca);
+
       auto rng_i = prior.random(), rng_j = q_j.random(), rng_k = q_k.random();
       std::vector<double> t_i(n), t_j(n), t_k(n), c_i(n), w(n), lp(n);
       for (std::size_t itt = 0; itt < n; ++itt) {
@@ -704,7 +732,7 @@ struct expectation_propagation_t
 
         /* branch length from eldest child to parent sampled from coalescent */
         t_i[itt] = std::max(t_j[itt], t_k[itt]);
-        c_i[itt] = rng_i(rng);
+        c_i[itt] = std::max(rng_i(rng), IS_MINGAP); // minimum age gap
         t_i[itt] = timescale.to_coalescents(t_i[itt]) + c_i[itt];
         t_i[itt] = timescale.to_generations(t_i[itt]);
 
@@ -811,7 +839,6 @@ struct expectation_propagation_t
     }
 };
 
-
 // -------------- RELATE API ------------------ //
 
 struct EstimateBranchLengthsVariational
@@ -846,6 +873,34 @@ struct EstimateBranchLengthsVariational
   }
 
   public:
+
+  static
+  std::vector<double> ages_from_lengths(const Tree& tree, const std::vector<double>& branch_lengths)
+  {
+    /* extract parent-child trios */
+    std::vector<trio_t> trios; trios.reserve(tree.nodes.size());
+    for (auto& i : tree.nodes) {
+      if (i.child_left != NULL and i.child_right != NULL) {
+        trios.emplace_back(i.label, i.child_left->label, i.child_right->label);
+      }
+    }
+  
+    /* order trios by leaves subtended by parent */
+    std::vector<Leaves> leaves; tree.FindAllLeaves(leaves);
+    std::sort(trios.begin(), trios.end(), [&leaves](const trio_t& x, const trio_t& y){
+        return leaves[x.parent].num_leaves < leaves[y.parent].num_leaves;
+    });
+
+    std::size_t E = trios.size(), N = 2*E + 1;
+
+    std::vector<double> ages (N, 0.0);
+    assert (branch_lengths.size() == N); //length of branch subtended by node
+    for (auto& i : trios) {
+      ages[i.parent] = (ages[i.lchild] + branch_lengths[i.lchild] + ages[i.rchild] + branch_lengths[i.rchild]) / 2.0;
+    }
+
+    return ages;
+  }
 
   /* ------- CONSTRUCTORS ------- */
 
@@ -886,7 +941,9 @@ struct EstimateBranchLengthsVariational
     /* extract parent-child trios */
     std::vector<trio_t> trios; trios.reserve(tree.nodes.size());
     for (auto& i : tree.nodes) {
-      trios.emplace_back(i.label, i.child_left->label, i.child_right->label);
+      if (i.child_left != NULL and i.child_right != NULL) {
+        trios.emplace_back(i.label, i.child_left->label, i.child_right->label);
+      }
     }
     // TODO: this assumes that node.label are in [0 ... num_samples*2 - 1] ...
     // is this always true?
@@ -896,12 +953,16 @@ struct EstimateBranchLengthsVariational
     std::sort(trios.begin(), trios.end(), [&leaves](const trio_t& x, const trio_t& y){
         return leaves[x.parent].num_leaves < leaves[y.parent].num_leaves;
     });
+    
+    for (auto& i : trios) { std::cout << "trios.emplace_back(" << i.parent << "," << i.lchild << "," << i.rchild << ");" << std::endl; }//DEBUG
 
     /* convert mutational counts and areas to gamma natural parameters */
     std::vector<gamma_distr_t> likelihoods;
     for (auto& i : tree.nodes) {
       likelihoods.emplace_back(i.num_events, -mutational_target(i));
     }
+
+    for (auto& i : likelihoods) { std::cout << "mutation_spans.emplace_back(" << i.alpha << "," << i.beta << ");" << std::endl; }//DEBUG
 
     /* calculate topology-conditioned coalescent prior */
     conditional_coalescent_prior_t prior (trios);

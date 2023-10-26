@@ -13,6 +13,10 @@
 #include "branch_length_estimator.hpp"
 #include "anc_builder.hpp"
 
+#include "expectation_propagation.hpp" //DEBUG
+#include <chrono> //DEBUG
+using n_time = std::chrono::high_resolution_clock; //DEBUG
+
 void ShowProgress(int progress){
 
   std::cerr << "[" << progress << "%]\r";
@@ -752,6 +756,13 @@ int SampleBranchLengths(cxxopts::Options& options){
     EstimateBranchLengthsWithSampleAge bl(data);
     for(; it_seq != anc.seq.end(); it_seq++){
 
+      // DEBUG: temporaries
+      std::vector<double> timing_mcmc (num_samples);//DEBUG
+      std::vector<std::vector<double>> lengths_mcmc (num_samples, std::vector<double>(it_seq->tree.nodes.size(), 0.0));//DEBUG
+      std::vector<double> lengths_orig (it_seq->tree.nodes.size(), 0.0);//DEBUG
+      for (auto& n : it_seq->tree.nodes) lengths_orig[n.label] = n.branch_length;//DEBUG
+      auto ages_orig = EstimateBranchLengthsVariational::ages_from_lengths(it_seq->tree, lengths_orig);//DEBUG
+
       if(count_trees % progress_interval == 0){
         progress += progress_step;
         ShowProgress(progress); 
@@ -767,7 +778,12 @@ int SampleBranchLengths(cxxopts::Options& options){
         if(options.count("poplabels")){
           bl.MCMCCoalRatesSample(data, (*it_seq).tree, sample.group_of_haplotype, epoch, coal_rate_pair, num_proposals, 1, rand()); //this is estimating times     
         }else{
+          // DEBUG: time and record average
+          auto start = n_time::now();//DEBUG
           bl.MCMCVariablePopulationSizeSample(data, (*it_seq).tree, epoch, coalescent_rate, num_proposals, 1, rand()); //this is estimating times
+          auto end = n_time::now();//DEBUG
+          for (auto& n : it_seq->tree.nodes) lengths_mcmc[count][n.label] = n.branch_length;//DEBUG
+          timing_mcmc[count] = std::chrono::duration<double>(end - start).count();//DEBUG
         }
 
         if(format == "n"){
@@ -788,7 +804,12 @@ int SampleBranchLengths(cxxopts::Options& options){
         if(options.count("poplabels")){
           bl.MCMCCoalRatesSample(data, (*it_seq).tree, sample.group_of_haplotype, epoch, coal_rate_pair, num_proposals, 0, rand()); //this is estimating times     
         }else{
+          // DEBUG: time and record average
+          auto start = n_time::now();//DEBUG
           bl.MCMCVariablePopulationSizeSample(data, (*it_seq).tree, epoch, coalescent_rate, num_proposals, 0, rand()); //this is estimating times
+          auto end = n_time::now();//DEBUG
+          for (auto& n : it_seq->tree.nodes) lengths_mcmc[count][n.label] = n.branch_length;//DEBUG
+          timing_mcmc[count] = std::chrono::duration<double>(end - start).count();//DEBUG
         }
 
         if(format == "n"){
@@ -862,6 +883,81 @@ int SampleBranchLengths(cxxopts::Options& options){
 
         os << "\n";
 
+      }
+
+      // DEBUG: run EP, dump node ages
+      // put coal rates into correct for EP (TODO FIXME)
+      std::vector<double> ep_coal (coalescent_rate);
+      std::vector<double> ep_epoch (epoch);
+      if (ep_coal.size() > 1) {
+        std::for_each(ep_coal.begin(), ep_coal.end(), [&data](double& x){x/=data.Ne;});
+        ep_coal.pop_back();//why?
+      }
+      if (ep_epoch.size() > 1) {
+        std::for_each(ep_epoch.begin(), ep_epoch.end(), [&data](double& x){x*=data.Ne;});
+      }
+      std::cout << "dim: " << ep_epoch.size() << " " << ep_coal.size() << std::endl;//
+      std::cout << "epoch: "; for(auto& x : ep_epoch) std::cout << x << " "; std::cout << std::endl;//
+      std::cout << "rate: "; for(auto& x : ep_coal) std::cout << x << " "; std::cout << std::endl;//
+      //calculate EP node ages and timings across a grid of quadrature orders
+      std::vector<std::vector<double>> ages_ep;
+      std::vector<double> timings_ep;
+      for (auto order : {5, 10, 20}) {
+        EstimateBranchLengthsVariational ep(&data, ep_epoch, ep_coal, order);//
+        auto start = n_time::now();//
+        ep.EP(it_seq->tree);//
+        auto end = n_time::now();//
+        double timing_ep = std::chrono::duration<double>(end - start).count();//
+        std::vector<double> lengths_ep (lengths_orig.size(), 0.0);
+        for (auto& n : it_seq->tree.nodes) lengths_ep[n.label] = n.branch_length;
+        auto ages = EstimateBranchLengthsVariational::ages_from_lengths(it_seq->tree, lengths_ep);
+        ages_ep.push_back(ages);
+        timings_ep.push_back(timing_ep);
+      }
+      //calculate EP-IS node ages and timings across a grid of quadrature orders
+      std::vector<std::vector<double>> ages_is;
+      std::vector<double> timings_is;
+      for (auto is_samples : {100, 1000, 10000}) {
+        EstimateBranchLengthsVariational is(&data, ep_epoch, ep_coal, is_samples, count_trees);//
+        auto start = n_time::now();//
+        is.EP(it_seq->tree);//
+        auto end = n_time::now();//
+        double timing_is = std::chrono::duration<double>(end - start).count();//
+        std::vector<double> lengths_is (lengths_orig.size(), 0.0);
+        for (auto& n : it_seq->tree.nodes) lengths_is[n.label] = n.branch_length;
+        auto ages = EstimateBranchLengthsVariational::ages_from_lengths(it_seq->tree, lengths_is);
+        ages_is.push_back(ages);
+        timings_is.push_back(timing_is);
+      }
+      //calculate running average of mcmc node ages and timings, along a logarithmic grid in # samples
+      std::vector<std::vector<double>> ages_mcmc;
+      std::vector<double> timings_mcmc;
+      std::vector<double> running_ages (ages_orig.size(), 0.0);
+      std::partial_sum(timing_mcmc.begin(), timing_mcmc.end(), timing_mcmc.begin());//cumulative timing
+      double running_timing = 0.0;
+      for (int i=0; i<lengths_mcmc.size(); ++i) {
+        auto ages = EstimateBranchLengthsVariational::ages_from_lengths(it_seq->tree, lengths_mcmc[i]);
+        std::transform(running_ages.begin(), running_ages.end(), ages.begin(), running_ages.begin(), std::plus<>());
+        double grid = std::log10(i+1);
+        if (std::round(grid) == grid) {
+          ages_mcmc.push_back(running_ages);
+          for (auto &j : ages_mcmc.back()) j /= double(i+1);
+          timings_mcmc.push_back(timing_mcmc[i]);
+        }
+      }
+      //dump to stdout
+      int n_nodes = (it_seq->tree.nodes.size() + 1) / 2;
+      std::cout << "TIMING\t" << n_nodes << "\t" << count_trees;
+      for (int i=0; i<timings_mcmc.size(); ++i) std::cout << "\t" << timings_mcmc[i];
+      for (int i=0; i<timings_ep.size(); ++i) std::cout << "\t" << timings_ep[i];
+      for (int i=0; i<timings_is.size(); ++i) std::cout << "\t" << timings_is[i];
+      std::cout << std::endl;
+      for (auto& n : it_seq->tree.nodes) {
+        std::cout << "DATING\t" << n_nodes << "\t" << count_trees << "\t" << n.label << "\t" << ages_orig[n.label];
+        for (int i=0; i<ages_mcmc.size(); ++i) std::cout << "\t" << ages_mcmc[i][n.label] * data.Ne;
+        for (int i=0; i<ages_ep.size(); ++i) std::cout << "\t" << ages_ep[i][n.label];
+        for (int i=0; i<ages_is.size(); ++i) std::cout << "\t" << ages_is[i][n.label];
+        std::cout << std::endl;
       }
 
       count_trees++; 

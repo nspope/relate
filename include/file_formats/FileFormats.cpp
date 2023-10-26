@@ -1189,6 +1189,7 @@ GenerateSNPAnnotations(cxxopts::Options& options){
     m_hap.ReadSNP(sequence, bp);
 
     //std::cerr << (int)(data.L/100) << " " << snp % (int)(data.L/100) << std::endl;
+    // FIXME: on Linux systems, if (int)(data.L/100) is 0, then this will cause a floating point error
     if((snp % (int)(data.L/100)) == 0){
       std::cerr << "[" << percentage << "%]\r";
       percentage++;

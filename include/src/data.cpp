@@ -550,7 +550,7 @@ haps::ReadSNP(std::vector<char>& sequence, int& bp){
   fgets(line, 2*N+10, fp);
   char d = line[0];
   int i  = 0;
-  while(d != '\0' && it_seq != sequence.end()){
+  while(it_seq != sequence.end()){
     if(d == '0'){
       *it_seq = '0';
       it_seq++;

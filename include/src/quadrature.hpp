@@ -194,6 +194,7 @@ struct gauss_laguerre_t : protected gauss_quadrature_t
 
   gauss_laguerre_t (const std::size_t order, const double alpha)
   {
+    assert (alpha > -1.0);
 	  std::vector<double> offdiag(order), knots(order), logweights(order);
     double logconst = recurrence(order, alpha, knots, offdiag);
     golub_welsch(order, knots, offdiag, logweights);
@@ -209,7 +210,7 @@ struct gauss_laguerre_t : protected gauss_quadrature_t
 
 struct gauss_jacobi_t : protected gauss_quadrature_t
 {
-  /* Gauss-Jacobi quadrature for `f(x) (1 - x)^(alpha - beta) x^(beta - 1)` on [0, 1] */
+  /* Gauss-Jacobi quadrature for `f(x) (1 - x)^alpha x^beta` on [0, 1] */
 
   private:
   double recurrence (const std::size_t m, const double alpha, const double beta, std::vector<double>& aj, std::vector<double>& bj) 
@@ -237,161 +238,22 @@ struct gauss_jacobi_t : protected gauss_quadrature_t
 
   gauss_jacobi_t (const std::size_t order, const double alpha, const double beta)
   {
+    assert (beta > -1.0);
+    assert (alpha > -1.0);
 	  std::vector<double> offdiag(order), knots(order), logweights(order);
-    auto logconst = recurrence(order, alpha - beta, beta - 1.0, knots, offdiag);
+    auto logconst = recurrence(order, alpha, beta, knots, offdiag);
     golub_welsch(order, knots, offdiag, logweights);
     std::for_each(logweights.begin(), logweights.end(), 
         [&logconst](double& x){ x += logconst; }
     );
     /* rescale to [0, 1] */
     std::for_each(knots.begin(), knots.end(), [](double& x){ x = (x + 1.0) / 2.0; });
-    double scale = log(2.0) * alpha;
+    double scale = log(2.0) * (alpha + beta);
     std::for_each(logweights.begin(), logweights.end(), [&scale](double& x){ x -= scale; });
     /* fill grid */
     grid.reserve(order);
     for (std::size_t i = 0; i < order; ++i) grid.emplace_back(knots[i], logweights[i]);
   }
 };
-
-
-struct gauss_2f1_t : protected gauss_quadrature_t
-{
-  /* Gauss quadrature for `f(x) x^alpha (1 - zeta x)^beta (alpha + 1)` on [0, 1] */
-
-  private:
-  double recurrence(const std::size_t order, const double alpha, const double beta, const double zeta, std::vector<double>& aj, std::vector<double>& bj) {
-    /* n-th moment is 2F1(-beta, alpha + n + 1; alpha + n + 2; zeta)` */
-    std::vector<double> moments(2*order + 2);
-    for (std::size_t n = 0; n < 2*order + 2; ++n) {
-      moments[n] = std::pow(1.0/zeta, alpha + n + 1) *
-        betainc_t::lentz(alpha + n + 1, beta + 1, zeta); // rewrite 2F1 as incomplete beta
-    }
-    // TODO: this could be done using a recurrence relation:
-    // double I, B;
-    // B = exp(a * log(x) + b * log(1.0 - x) - log(a) - std::lgamma(a) - std::lgamma(b) + std::lgamma(a + b));
-    // I = betainc_t::lentz(a, b, x);
-    // for (std::size_t i = 0; i < order; ++i) {
-    //   I -= B;
-    //   B *= (a + b) / (a + 1.0) * x;
-    // }
-    // (however, `I` is regularized)
-
-    /* recurrence coefficients from moments */
-    recurrence_from_moments(moments, aj, bj);
-
-    return moments[0];
-  }
-
-  public:
-  std::vector<quadrature_node_t> grid;
-
-  gauss_2f1_t (const std::size_t order, const double alpha, const double beta, const double zeta)
-  {
-	  std::vector<double> offdiag(order), knots(order), logweights(order);
-    auto logconst = recurrence(order, alpha, beta, zeta, knots, offdiag);
-    golub_welsch(order, knots, offdiag, logweights);
-    std::for_each(logweights.begin(), logweights.end(), 
-        [&logconst](double& x){ x += logconst; }
-    );
-    /* fill grid */
-    grid.reserve(order);
-    for (std::size_t i = 0; i < order; ++i) grid.emplace_back(knots[i], logweights[i]);
-  }
-};
-
-
-/* ----------- STRATIFIED RULES ------------ */
-
-//template <class T>
-//struct antigauss_quadrature : protected gauss_quadrature_t
-//{
-//  // take an existing rule, use it's class matrix to make a new class matrix
-//};
-
-
-struct nested_gauss_laguerre_t : protected gauss_quadrature_t
-{
-  /* Stratified Gauss-Laguerre rule for `f(x) x^alpha exp(-x) / gamma(alpha + 1)` on [0, infty) 
-     The stratification method in XXXX gives rise to two nested quadrature rules */
-
-  private:
-  double recurrence (const std::size_t m, const double alpha, const double beta, std::vector<double>& aj, std::vector<double>& bj) 
-  {
-    /* Calculate Jacobi matrix */ 
-    std::size_t M = 2*m + 1;
-    assert (bj.size() == M);
-    assert (aj.size() == M);
-    double logconst = std::lgamma(alpha + 1.0);
-    // (m + 1)-order rule
-    for (std::size_t i = 1; i <= m + 1; ++i) {
-        aj[i-1] = 2.0*i - 1.0 + alpha;
-        bj[i-1] = std::sqrt(i*(i + alpha));
-    }
-    // m-order rule in reverse
-    std::size_t k = m + 1;
-    for (std::size_t i = m; i >= 1; --i) {
-        aj[k] = aj[i-1];
-        if (i != 1) bj[k] = bj[i-2];
-        k++;
-    }
-    return logconst;
-  }
-
-  public:
-  std::vector<quadrature_node_t> grid;
-
-  nested_gauss_laguerre_t (const std::size_t order, const double alpha)
-  {
-	  std::vector<double> offdiag(2*order + 1), knots(2*order + 1), logweights(2*order + 1);
-    double logconst = recurrence(order, alpha, 1.0, knots, offdiag);
-    golub_welsch(2*order + 1, knots, offdiag, logweights);
-    std::for_each(logweights.begin(), logweights.end(), 
-        [&logconst](double& x){ x += logconst; }
-    );
-    /* fill grid */
-    grid.reserve(2*order + 1);
-    for (std::size_t i = 0; i < 2*order + 1; ++i) grid.emplace_back(knots[i], logweights[i]);
-  }
-};
-
-struct extended_gauss_laguerre_t : protected gauss_quadrature_t
-{
-  /* Stratified Gauss-Laguerre rule for `f(x) x^alpha exp(-x) / gamma(alpha + 1)` on [0, infty) 
-     The stratification method in XXXX gives rise to two nested quadrature rules */
-
-  private:
-  double recurrence (const std::size_t m, const double alpha, const double beta, std::vector<double>& aj, std::vector<double>& bj) 
-  {
-    /* Calculate Jacobi matrix */ 
-    assert (bj.size() == m + 1);
-    assert (aj.size() == m + 1);
-    double logconst = std::lgamma(alpha + 1.0);
-    // (m + 1)-order rule
-    for (std::size_t i = 1; i <= m + 1; ++i) {
-        aj[i-1] = 2.0*i - 1.0 + alpha;
-        bj[i-1] = std::sqrt(i*(i + alpha));
-    }
-    bj[m-1] = std::sqrt(bj[m-1]*bj[m-1] + bj[m]*bj[m]);
-    bj[m] = 0.0;
-    return logconst;
-  }
-
-  public:
-  std::vector<quadrature_node_t> grid;
-
-  extended_gauss_laguerre_t (const std::size_t order, const double alpha)
-  {
-	  std::vector<double> offdiag(order + 1), knots(order + 1), logweights(order + 1);
-    double logconst = recurrence(order, alpha, 1.0, knots, offdiag);
-    golub_welsch(order + 1, knots, offdiag, logweights);
-    std::for_each(logweights.begin(), logweights.end(), 
-        [&logconst](double& x){ x += logconst; }
-    );
-    /* fill grid */
-    grid.reserve(order + 1);
-    for (std::size_t i = 0; i < order + 1; ++i) grid.emplace_back(knots[i], logweights[i]);
-  }
-};
-
 
 #endif

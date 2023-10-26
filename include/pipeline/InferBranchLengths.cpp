@@ -5,12 +5,16 @@
 #include <sys/resource.h>
 #include <string>
 
+#include <chrono> //DEBUG
+
 #include "cxxopts.hpp"
 #include "data.hpp"
 #include "anc.hpp"
 #include "branch_length_estimator.hpp"
 #include "anc_builder.hpp"
 #include "expectation_propagation.hpp"
+
+using n_time = std::chrono::high_resolution_clock; //DEBUG
 
 int GetBranchLengths(cxxopts::Options& options, int chunk_index, int first_section, int last_section){
 
@@ -30,7 +34,7 @@ int GetBranchLengths(cxxopts::Options& options, int chunk_index, int first_secti
 
   std::size_t order = options.count("order") ? options["order"].as<std::size_t>() : 10;
   if (options.count("variational")) {
-    std::cout << "Using expectation propagation (quadrature order: " << order << ") to infer branch lengths (experimental)" << std::endl;
+    std::cerr << "Using expectation propagation (quadrature order: " << order << ") to infer branch lengths (experimental)" << std::endl;
   }
 
   int seed;
@@ -194,6 +198,15 @@ int GetBranchLengths(cxxopts::Options& options, int chunk_index, int first_secti
       if (options.count("variational")) {
         /* Infer branch lengths with EP */
         if (is_coal) {
+          /* TODO */
+          if (coalescent_rate.size() > 1) {
+            std::for_each(coalescent_rate.begin(), coalescent_rate.end(), [&data](double& x){x/=data.Ne;});
+            coalescent_rate.pop_back();
+          }
+          if (epoch.size() > 1) {
+            std::for_each(epoch.begin(), epoch.end(), [&data](double& x){x*=data.Ne;});
+            epoch.pop_back();
+          }
           EstimateBranchLengthsVariational bl(&data, epoch, coalescent_rate, order);
           for(auto itt = anc.seq.begin(); itt != anc.seq.end(); ++itt) bl.EP(itt->tree);
         } else {
