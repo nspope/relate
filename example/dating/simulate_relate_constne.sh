@@ -7,15 +7,15 @@ RELATE_DIR=`pwd`/../../../../repo/relate
 #cmake .. && make && cd ../..
 RELATE_LIB=`pwd`/../../../../relate_lib 
 
-SEED="1023"
+SEED=$1
 ID="chr1"
 SEQLEN=100000
-SAMPLES=100 #diploid
+SAMPLES=1000 #diploid
 MCMC_DRAWS=1000
 QUAD_ORDER=10
 NUM_THREADS=12
 
-WORK_DIR=`pwd`/sim_$SEED
+WORK_DIR=`pwd`/sim_constne/$SEED
 IN_DIR=$WORK_DIR/relate_inputs
 OUT_DIR=$WORK_DIR/relate_outputs
 BENCH_DIR=$WORK_DIR/benchmarks
@@ -38,8 +38,7 @@ id = "%s"
 seqlen = %s
 samples = %s
 homsap = stdpopsim.get_species("HomSap")
-zigzag = homsap.get_demographic_model("Zigzag_1S14")
-#zigzag = stdpopsim.PiecewiseConstantSize(10000)
+zigzag = stdpopsim.PiecewiseConstantSize(10000)
 engine = stdpopsim.get_engine("msprime")
 genmap = homsap.get_contig("chr1", genetic_map="HapMapII_GRCh38").recombination_map
 endpnt = genmap.position[1]
@@ -52,14 +51,13 @@ print(chrom1.mutation_rate, file=muout)
 muout.close()
 ts = engine.simulate(
   contig=chrom1, demographic_model=zigzag, 
-  #samples={"pop_0":samples}, seed=seed,
-  samples={"generic":samples}, seed=seed,
+  samples={"pop_0":samples}, seed=seed,
 )
 ts.dump(f"{id}.trees")
 ts.write_vcf(
   open(f"{id}.vcf", "w"), 
   contig_id=id,
-  individual_names=[f"ZIGZAG{i}" for i in range(samples)],
+  individual_names=[f"CONST{i}" for i in range(samples)],
   position_transform=lambda p: [x-1 for x in p],
 )
 neout = open(f"{id}.ne", "w")
@@ -71,13 +69,12 @@ print(int(ts.sequence_length), file=lnout)
 lnout.close()
 
 dbg = zigzag.model.debug()
-steps = np.linspace(0, 40000, 100)
-coalrate, _ = dbg.coalescence_rate_trajectory(lineages={"generic":2}, steps=steps)
-#coalrate, _ = dbg.coalescence_rate_trajectory(lineages={"pop_0":2}, steps=steps)
+steps = np.linspace(0, 40000, 2)
+coalrate, _ = dbg.coalescence_rate_trajectory(lineages={"pop_0":2}, steps=steps)
 coalout = open(f"{id}.coal", "w")
 print("0", file=coalout)
-print(" ".join([str(int(x)) for x in steps]), file=coalout)
-print("0 0", " ".join([str(x) for x in coalrate]), file=coalout)
+print(" ".join([str(int(x)) for x in steps[:1]]), file=coalout)
+print("0 0", " ".join([str(x) for x in coalrate[:1]]), file=coalout)
 coalout.close()
 recout = open(f"{id}.hapmap", "w")
 genmap = chrom1.recombination_map
@@ -139,15 +136,30 @@ $RELATE_DIR/scripts/PrepareInputFiles/PrepareInputFiles.sh \
 
 $RELATE_DIR/bin/Relate --mode All -m $MU -N $NE \
   --haps $ID.haps.gz --sample $ID.sample.gz --annot $ID.annot --seed $SEED \
-  --dist $ID.dist.gz --map $ID.hapmap -o $ID >$BENCH_DIR/mcmc.coal
+  --dist $ID.dist.gz --map $ID.hapmap -o $ID
 
 # --- ESTIMATE BRANCH LENGTHS USING MCMC --- #
 
+# --- INFERRED TOPOLOGIES
 cd $WORK_DIR
 $RELATE_DIR/scripts/SampleBranchLengths/SampleBranchLengths.sh \
   -i $IN_DIR/$ID \
   -o $OUT_DIR/$ID.sample \
   -m $MU \
-  --coal $WORK_DIR/$ID.coal \
+  --coal $IN_DIR/${ID}.coal \
   --seed $SEED \
   --num_samples ${MCMC_DRAWS} > $BENCH_DIR/benchmarks
+
+## --- TRUE TOPOLOGIES
+#cd $WORK_DIR
+#$RELATE_LIB/bin/Convert --mode ConvertFromTreeSequence \
+#  -i $WORK_DIR/$ID.trees --anc $IN_DIR/${ID}_true.anc --mut $IN_DIR/${ID}_true.mut
+#
+#cd $WORK_DIR
+#$RELATE_DIR/scripts/SampleBranchLengths/SampleBranchLengths.sh \
+#  -i $IN_DIR/${ID}_true \
+#  -o $OUT_DIR/${ID}_true_sample \
+#  -m $MU \
+#  --coal $IN_DIR/${ID}.coal \
+#  --seed $SEED \
+#  --num_samples ${MCMC_DRAWS} > $BENCH_DIR/benchmarks_true
