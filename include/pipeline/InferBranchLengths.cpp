@@ -197,6 +197,7 @@ int GetBranchLengths(cxxopts::Options& options, int chunk_index, int first_secti
 
       if (options.count("variational")) {
         /* Infer branch lengths with EP */
+        int seed = 0;
         if (is_coal) {
           /* TODO */
           if (coalescent_rate.size() > 1) {
@@ -207,10 +208,14 @@ int GetBranchLengths(cxxopts::Options& options, int chunk_index, int first_secti
             std::for_each(epoch.begin(), epoch.end(), [&data](double& x){x*=data.Ne;});
             epoch.pop_back();
           }
-          EstimateBranchLengthsVariational bl(&data, epoch, coalescent_rate, order);
+          //std::cout << "Tree " << seed << std::endl;//DEBUG
+          EstimateBranchLengthsVariational bl(&data, epoch, coalescent_rate, order, seed++);
+          //EstimateBranchLengthsVariational bl(&data, epoch, coalescent_rate, order);
           for(auto itt = anc.seq.begin(); itt != anc.seq.end(); ++itt) bl.EP(itt->tree);
         } else {
-          EstimateBranchLengthsVariational bl(&data, 1.0 / data.Ne, order);
+          //EstimateBranchLengthsVariational bl(&data, 1.0 / data.Ne, order);
+          //std::cout << "Tree " << seed << std::endl;//DEBUG
+          EstimateBranchLengthsVariational bl(&data, 1.0 / data.Ne, order, seed++); //importance sample
           for(auto itt = anc.seq.begin(); itt != anc.seq.end(); ++itt) bl.EP(itt->tree);
         }
       } else {

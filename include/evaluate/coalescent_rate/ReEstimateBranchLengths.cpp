@@ -15,6 +15,7 @@
 
 #include "expectation_propagation.hpp" //DEBUG
 #include <chrono> //DEBUG
+#include <deque> //DEBUG
 using n_time = std::chrono::high_resolution_clock; //DEBUG
 
 void ShowProgress(int progress){
@@ -902,7 +903,7 @@ int SampleBranchLengths(cxxopts::Options& options){
       //calculate EP node ages and timings across a grid of quadrature orders
       std::vector<std::vector<double>> ages_ep;
       std::vector<double> timings_ep;
-      for (auto order : {5, 10, 20}) {
+      for (auto order : {8, 10, 20}) {
         EstimateBranchLengthsVariational ep(&data, ep_epoch, ep_coal, order);//
         auto start = n_time::now();//
         ep.EP(it_seq->tree);//
@@ -935,11 +936,14 @@ int SampleBranchLengths(cxxopts::Options& options){
       std::vector<double> running_ages (ages_orig.size(), 0.0);
       std::partial_sum(timing_mcmc.begin(), timing_mcmc.end(), timing_mcmc.begin());//cumulative timing
       double running_timing = 0.0;
+      std::deque<int> monitor = {1, 3, 10, 32, 100, 316, 1000, 3162, 10000, 31623, 100000};
       for (int i=0; i<lengths_mcmc.size(); ++i) {
         auto ages = EstimateBranchLengthsVariational::ages_from_lengths(it_seq->tree, lengths_mcmc[i]);
         std::transform(running_ages.begin(), running_ages.end(), ages.begin(), running_ages.begin(), std::plus<>());
-        double grid = std::log10(i+1);
-        if (std::round(grid) == grid) {
+        //double grid = std::log10(i+1); //every order of magnitude
+        //if (std::round(grid) == grid) {
+        if ( (i+1) == monitor.front() ) {
+          monitor.pop_front();
           ages_mcmc.push_back(running_ages);
           for (auto &j : ages_mcmc.back()) j /= double(i+1);
           timings_mcmc.push_back(timing_mcmc[i]);
